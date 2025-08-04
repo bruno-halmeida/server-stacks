@@ -1,0 +1,56 @@
+services:
+  traefik:
+    image: traefik:latest
+    command:
+      - "--api.dashboard=false"
+      - "--api.insecure=false"  # Dashboard is not exposed insecurely
+      - "--providers.swarm=true"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--providers.swarm.network=swarm_network"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.email=brunoh.mobile@gmail.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certificates/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      # Global HTTP to HTTPS redirect
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certificates:/certificates
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        # Security headers middleware definition
+        - "traefik.http.middlewares.securityHeaders.headers.forceSTSHeader=true"
+        - "traefik.http.middlewares.securityHeaders.headers.sslRedirect=true"
+        - "traefik.http.middlewares.securityHeaders.headers.stsIncludeSubdomains=true"
+        - "traefik.http.middlewares.securityHeaders.headers.stsPreload=true"
+        - "traefik.http.middlewares.securityHeaders.headers.stsSeconds=31536000"
+    networks:
+      - swarm_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  swarm_network:
+    driver: overlay
+    external: true
+
+volumes:
+  traefik-certificates:
