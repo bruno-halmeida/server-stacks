@@ -1,0 +1,75 @@
+services:
+  registry:
+    image: registry:2
+    # O Registry gerencia a auth internamente (mais seguro p/ docker login)
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      # Importante para o Registry saber que está atrás de HTTPS
+      REGISTRY_HTTP_ADDR: 0.0.0.0:5000
+      REGISTRY_HTTP_HEADERS_X_FORWARDED_PROTO: https
+      # Health check configuration
+      REGISTRY_HEALTH_STORAGEDRIVER_ENABLED: "true"
+      REGISTRY_HEALTH_STORAGEDRIVER_INTERVAL: 10s
+      REGISTRY_HEALTH_STORAGEDRIVER_THRESHOLD: 3
+    volumes:
+      - ./auth:/auth                 # Mapeia o arquivo de senha
+      - ./data:/var/lib/registry     # Persistência dos dados
+    networks:
+      - swarm_network               # Conecta na rede do Traefik
+    # Health check para auto-healing do Swarm
+    # Removido pois wget não está disponível no registry:2
+    # O registry tem health check interno via REGISTRY_HEALTH_*
+    # healthcheck:
+    #   test: ["CMD-SHELL", "nc -z localhost 5000 || exit 1"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 40s
+    # Configuração específica para Docker Swarm
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          # Deploy no manager para manter persistência
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        order: stop-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+      # Limites de recursos
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+      # Labels do Traefik devem estar dentro do deploy para Swarm
+      labels:
+        - "traefik.enable=true"
+        # Configuração do roteador
+        - "traefik.http.routers.myregistry.rule=Host(`registry.merkos.com.br`)"
+        - "traefik.http.routers.myregistry.entrypoints=websecure"
+        - "traefik.http.routers.myregistry.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.myregistry.service=myregistry"
+        # Configuração do serviço
+        - "traefik.http.services.myregistry.loadbalancer.server.port=5000"
+        # Sticky sessions para melhor performance
+        - "traefik.http.services.myregistry.loadbalancer.sticky=true"
+
+networks:
+  swarm_network:
+    external: true
