@@ -1,0 +1,303 @@
+services:
+  db:
+    image: mariadb:11.4
+    # DB só existe na rede interna; não é alcançável do Traefik nem da internet.
+    networks:
+      - blog_internal
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD_FILE: /run/secrets/wp_db_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_AUTO_UPGRADE: "1"
+    secrets:
+      - source: db_root_password
+        target: db_root_password
+      - source: wp_db_password
+        target: wp_db_password
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  wordpress:
+    image: wordpress:6.8-php8.3-apache
+    depends_on:
+      - db
+    networks:
+      - blog_internal   # fala com o DB
+      - swarm_network   # visível pro Traefik
+    volumes:
+      - wp_data:/var/www/html
+      - /root/applications/server-stacks/blog/wp-merkos-theme:/var/www/html/wp-content/themes/merkos:ro
+      - /root/applications/server-stacks/blog/mu-plugins:/var/www/html/wp-content/mu-plugins:ro
+      - /root/applications/server-stacks/blog/apache-conf/hardening.conf:/etc/apache2/conf-enabled/zz-hardening.conf:ro
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD_FILE: /run/secrets/wp_db_password
+      WORDPRESS_TABLE_PREFIX: mkb_
+      # Salts individuais (a imagem wordpress lê _FILE e injeta cada chave no wp-config)
+      WORDPRESS_AUTH_KEY_FILE:         /run/secrets/wp_auth_key
+      WORDPRESS_SECURE_AUTH_KEY_FILE:  /run/secrets/wp_secure_auth_key
+      WORDPRESS_LOGGED_IN_KEY_FILE:    /run/secrets/wp_logged_in_key
+      WORDPRESS_NONCE_KEY_FILE:        /run/secrets/wp_nonce_key
+      WORDPRESS_AUTH_SALT_FILE:        /run/secrets/wp_auth_salt
+      WORDPRESS_SECURE_AUTH_SALT_FILE: /run/secrets/wp_secure_auth_salt
+      WORDPRESS_LOGGED_IN_SALT_FILE:   /run/secrets/wp_logged_in_salt
+      WORDPRESS_NONCE_SALT_FILE:       /run/secrets/wp_nonce_salt
+      # Hardening via wp-config: desabilita editor, força SSL no admin, auto-updates só minor.
+      WORDPRESS_CONFIG_EXTRA: |
+        define('DISALLOW_FILE_EDIT', true);
+        define('DISALLOW_FILE_MODS', false);
+        define('FORCE_SSL_ADMIN', true);
+        define('WP_AUTO_UPDATE_CORE', 'minor');
+        define('AUTOMATIC_UPDATER_DISABLED', false);
+        define('WP_POST_REVISIONS', 10);
+        define('EMPTY_TRASH_DAYS', 15);
+        // wp-cron externo é vetor de DDoS; desligamos e disparamos internamente via sidecar.
+        define('DISABLE_WP_CRON', true);
+        // Traefik encerra TLS — precisamos confiar no X-Forwarded-Proto
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+            $$_SERVER['HTTPS'] = 'on';
+        }
+        if (isset($$_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            $$_SERVER['REMOTE_ADDR'] = trim(explode(',', $$_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
+        }
+    secrets:
+      - source: wp_db_password
+        target: wp_db_password
+      - source: wp_auth_key
+        target: wp_auth_key
+      - source: wp_secure_auth_key
+        target: wp_secure_auth_key
+      - source: wp_logged_in_key
+        target: wp_logged_in_key
+      - source: wp_nonce_key
+        target: wp_nonce_key
+      - source: wp_auth_salt
+        target: wp_auth_salt
+      - source: wp_secure_auth_salt
+        target: wp_secure_auth_salt
+      - source: wp_logged_in_salt
+        target: wp_logged_in_salt
+      - source: wp_nonce_salt
+        target: wp_nonce_salt
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H 'Host: blog.merkos.com.br' http://localhost/wp-login.php >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=swarm_network"
+
+        # ---------- Middlewares ----------
+        # Rate-limit p/ endpoints sensíveis (login + admin-ajax): 5 req/s com burst 10
+        - "traefik.http.middlewares.blog-login-ratelimit.ratelimit.average=5"
+        - "traefik.http.middlewares.blog-login-ratelimit.ratelimit.burst=10"
+        - "traefik.http.middlewares.blog-login-ratelimit.ratelimit.period=1s"
+        # Middleware genérico de deny: só loopback passa. Reusado por xmlrpc e deny-misc.
+        # Como Traefik proxa a partir de IPs externos, 127.0.0.1/32 == nunca.
+        - "traefik.http.middlewares.blog-loopback-only.ipallowlist.sourcerange=127.0.0.1/32"
+        # Cabeçalhos de segurança completos (HSTS + XSS + clickjacking + referrer + permissions)
+        - "traefik.http.middlewares.blog-headers.headers.browserXssFilter=true"
+        - "traefik.http.middlewares.blog-headers.headers.contentTypeNosniff=true"
+        - "traefik.http.middlewares.blog-headers.headers.frameDeny=true"
+        - "traefik.http.middlewares.blog-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+        - "traefik.http.middlewares.blog-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=()"
+        - "traefik.http.middlewares.blog-headers.headers.forceSTSHeader=true"
+        - "traefik.http.middlewares.blog-headers.headers.stsSeconds=31536000"
+        - "traefik.http.middlewares.blog-headers.headers.stsIncludeSubdomains=true"
+        - "traefik.http.middlewares.blog-headers.headers.stsPreload=true"
+        - "traefik.http.middlewares.blog-headers.headers.customResponseHeaders.X-Robots-Tag=index, follow"
+        # Esconde versões do stack (defesa-em-profundidade contra scanners automatizados)
+        - "traefik.http.middlewares.blog-headers.headers.customResponseHeaders.Server="
+        - "traefik.http.middlewares.blog-headers.headers.customResponseHeaders.X-Powered-By="
+        # CSP — pragmático pra WP: unsafe-inline/eval em scripts (WP usa muito), sem object/frame-ancestors, form só pra self.
+        # Se algo quebrar, ativar report-only temporariamente removendo o header e mudando pra Content-Security-Policy-Report-Only.
+        - "traefik.http.middlewares.blog-headers.headers.contentSecurityPolicy=default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://s.w.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+
+        # ---------- Routers ----------
+        # 1) XML-RPC: prioridade alta, bloqueado
+        - "traefik.http.routers.blog-xmlrpc.rule=Host(`blog.merkos.com.br`) && Path(`/xmlrpc.php`)"
+        - "traefik.http.routers.blog-xmlrpc.entrypoints=websecure"
+        - "traefik.http.routers.blog-xmlrpc.tls=true"
+        - "traefik.http.routers.blog-xmlrpc.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.blog-xmlrpc.priority=110"
+        - "traefik.http.routers.blog-xmlrpc.middlewares=blog-loopback-only@swarm"
+        - "traefik.http.routers.blog-xmlrpc.service=blog-wp"
+
+        # 2) Deny misc: info-disclosure e wp-cron externo (DDoS amplification)
+        - "traefik.http.routers.blog-deny-misc.rule=Host(`blog.merkos.com.br`) && (Path(`/readme.html`) || Path(`/license.txt`) || Path(`/wp-cron.php`))"
+        - "traefik.http.routers.blog-deny-misc.entrypoints=websecure"
+        - "traefik.http.routers.blog-deny-misc.tls=true"
+        - "traefik.http.routers.blog-deny-misc.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.blog-deny-misc.priority=105"
+        - "traefik.http.routers.blog-deny-misc.middlewares=blog-loopback-only@swarm"
+        - "traefik.http.routers.blog-deny-misc.service=blog-wp"
+
+        # 3) Login / register / xmlrpc endpoints com rate-limit
+        - "traefik.http.routers.blog-login.rule=Host(`blog.merkos.com.br`) && (Path(`/wp-login.php`) || PathPrefix(`/wp-admin/admin-ajax.php`))"
+        - "traefik.http.routers.blog-login.entrypoints=websecure"
+        - "traefik.http.routers.blog-login.tls=true"
+        - "traefik.http.routers.blog-login.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.blog-login.priority=90"
+        - "traefik.http.routers.blog-login.middlewares=blog-login-ratelimit@swarm,blog-headers@swarm"
+        - "traefik.http.routers.blog-login.service=blog-wp"
+
+        # 4) Router padrão do site
+        - "traefik.http.routers.blog.rule=Host(`blog.merkos.com.br`)"
+        - "traefik.http.routers.blog.entrypoints=websecure"
+        - "traefik.http.routers.blog.tls=true"
+        - "traefik.http.routers.blog.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.blog.priority=10"
+        - "traefik.http.routers.blog.middlewares=blog-headers@swarm"
+        - "traefik.http.routers.blog.service=blog-wp"
+
+        # ---------- Service ----------
+        - "traefik.http.services.blog-wp.loadbalancer.server.port=80"
+        - "traefik.http.services.blog-wp.loadbalancer.passhostheader=true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Sidecar: dispara /wp-cron.php a cada 5 min pela rede interna,
+  # já que bloqueamos acesso externo. Não passa pelo Traefik.
+  wp-cron:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      - wordpress
+    networks:
+      - blog_internal
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          sleep 300
+          curl -fsS -o /dev/null --max-time 60 \
+            -H 'Host: blog.merkos.com.br' \
+            -H 'X-Forwarded-Proto: https' \
+            'http://wordpress/wp-cron.php?doing_wp_cron' || true
+        done
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 30s
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32M
+        reservations:
+          memory: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
+
+networks:
+  blog_internal:
+    driver: overlay
+    internal: true      # sem rota pra internet; DB nunca sai
+    attachable: false
+  swarm_network:
+    external: true
+
+volumes:
+  db_data:
+  wp_data:
+
+secrets:
+  db_root_password:
+    external: true
+    name: blog_db_root_password_v20260416212324
+  wp_db_password:
+    external: true
+    name: blog_wp_db_password_v20260416212324
+  wp_auth_key:
+    external: true
+    name: blog_wp_auth_key_v20260416212324
+  wp_secure_auth_key:
+    external: true
+    name: blog_wp_secure_auth_key_v20260416212324
+  wp_logged_in_key:
+    external: true
+    name: blog_wp_logged_in_key_v20260416212324
+  wp_nonce_key:
+    external: true
+    name: blog_wp_nonce_key_v20260416212324
+  wp_auth_salt:
+    external: true
+    name: blog_wp_auth_salt_v20260416212324
+  wp_secure_auth_salt:
+    external: true
+    name: blog_wp_secure_auth_salt_v20260416212324
+  wp_logged_in_salt:
+    external: true
+    name: blog_wp_logged_in_salt_v20260416212324
+  wp_nonce_salt:
+    external: true
+    name: blog_wp_nonce_salt_v20260416212324
